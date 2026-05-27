@@ -124,6 +124,7 @@ three are required; the rest have sensible defaults.
 | `MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS` | `90` | Restart if no first frame after connect |
 | `MAMMOTION_SOFT_STALL_TIMEOUT_SECONDS` | `12` | Request a keyframe after this much stall |
 | `MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS` | `8` | Min seconds between keyframe requests |
+| `MAMMOTION_RECOVERY_COOLDOWN_SECONDS` | `10` | Min seconds between Mammotion publisher wake-up commands |
 | `MAMMOTION_FRAME_STALL_TIMEOUT_SECONDS` | `120` | Hard-restart cycle if frames/publisher stay gone this long |
 
 ### Browser-controlled streaming
@@ -149,9 +150,11 @@ stops if the publisher stays offline for three minutes. Set
 `MAMMOTION_KEEPALIVE_SECONDS` above `0` only if you need to reduce short Agora
 publisher drops; keep-alives are sent only while the publisher is online. When
 the Agora publisher drops, the bridge schedules recovery after any active
-cooldown instead of losing the recovery event. If Mammotion/Aliyun rejects a
-cloud session during a manual run, the stream process backs off instead of
-retrying rapidly.
+cooldown instead of losing the recovery event. The compose example uses a 10 s
+recovery cooldown to reduce visible freezes without increasing wake-up frequency
+beyond the observed publisher-drop cadence. If Mammotion/Aliyun rejects a cloud
+session during a manual run, the stream process backs off instead of retrying
+rapidly.
 
 ### go2rtc / Frigate
 

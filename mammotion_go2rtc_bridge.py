@@ -33,6 +33,7 @@ class Settings:
     soft_stall_timeout_seconds: int
     frame_stall_timeout_seconds: int
     keyframe_request_cooldown_seconds: int
+    recovery_cooldown_seconds: int
     keepalive_seconds: int
     heartbeat_file: str
     dump_stream_json: bool
@@ -97,6 +98,12 @@ def parse_args() -> Settings:
         default=int(os.getenv("MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS", "8")),
     )
     parser.add_argument(
+        "--recovery-cooldown-seconds",
+        type=int,
+        default=int(os.getenv("MAMMOTION_RECOVERY_COOLDOWN_SECONDS", "10")),
+        help="Minimum seconds between Mammotion publisher wake-up commands.",
+    )
+    parser.add_argument(
         "--keepalive-seconds",
         type=int,
         default=int(os.getenv("MAMMOTION_KEEPALIVE_SECONDS", "0")),
@@ -152,6 +159,7 @@ def parse_args() -> Settings:
         soft_stall_timeout_seconds=max(3, args.soft_stall_timeout_seconds),
         frame_stall_timeout_seconds=max(10, args.frame_stall_timeout_seconds),
         keyframe_request_cooldown_seconds=max(2, args.keyframe_request_cooldown_seconds),
+        recovery_cooldown_seconds=max(1, args.recovery_cooldown_seconds),
         keepalive_seconds=max(0, args.keepalive_seconds),
         heartbeat_file=(args.heartbeat_file or "").strip(),
         dump_stream_json=bool(args.dump_stream_json),
@@ -750,6 +758,7 @@ async def run_stream_loop(
                 area_code=resolve_area_code(fields.get("areaCode")),
                 heartbeat_file=settings.heartbeat_file,
             )
+            bridge.PEER_RECOVER_COOLDOWN_SECS = float(settings.recovery_cooldown_seconds)
             bridge.configure_recovery(
                 mammotion=mammotion,
                 device_name=fields["device_name"],
@@ -988,6 +997,8 @@ class StreamController:
             str(self.settings.frame_stall_timeout_seconds),
             "--keyframe-request-cooldown-seconds",
             str(self.settings.keyframe_request_cooldown_seconds),
+            "--recovery-cooldown-seconds",
+            str(self.settings.recovery_cooldown_seconds),
             "--keepalive-seconds",
             str(self.settings.keepalive_seconds),
             "--heartbeat-file",
