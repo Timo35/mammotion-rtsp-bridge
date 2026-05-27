@@ -1,8 +1,8 @@
 services:
   mammotion-bridge:
-    # Prebuilt multi-arch image (amd64 + arm64) from GitHub Container Registry.
-    # :stable = newest tagged release (recommended). Use :latest for bleeding edge.
-    image: ghcr.io/bleialf/mammotion-rtsp-bridge:stable
+    # Local build includes the browser-control changes in this checkout.
+    build: .
+    image: mammotion-rtsp-bridge:local
     container_name: mammotion-bridge
     restart: unless-stopped
     environment:
@@ -15,7 +15,13 @@ services:
       # end must match the go2rtc/Frigate config. Use the Frigate service name if
       # in the same compose stack, else the host/IP go2rtc is reachable at.
       GO2RTC_PUBLISH_URL: "rtsp://frigate:8554/mammotion"
-      # File touched per frame, for the healthcheck below.
+      # Browser control mode: container stays up, stream starts only after click.
+      # Open http://<docker-host>:8099 after exposing the port below.
+      MAMMOTION_CONTROL_ENABLED: "true"
+      MAMMOTION_CONTROL_PORT: "8099"
+      # Optional: stop automatically after N seconds (0 = off).
+      MAMMOTION_CONTROL_AUTO_STOP_SECONDS: "0"
+      # File touched per frame when the stream is actually running.
       MAMMOTION_HEARTBEAT_FILE: "/tmp/mammotion_heartbeat"
 
       # ── Optional tuning (defaults shown; uncomment to change) ─────────────
@@ -25,8 +31,13 @@ services:
       #MAMMOTION_SOFT_STALL_TIMEOUT_SECONDS: "12"           # request keyframe after stall
       #MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS: "8"     # min gap between keyframe reqs
       #MAMMOTION_FRAME_STALL_TIMEOUT_SECONDS: "120"         # hard-restart cycle if stalled
+    ports:
+      - "8099:8099"               # browser control UI
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import os,time; p=\"/tmp/mammotion_heartbeat\"; exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)'"]
+      test:
+        - CMD-SHELL
+        - >-
+          python -c 'import os,time,sys,urllib.request; control=os.getenv("MAMMOTION_CONTROL_ENABLED","").lower() in ("1","true","yes","on"); port=os.getenv("MAMMOTION_CONTROL_PORT","8099"); p="/tmp/mammotion_heartbeat"; urllib.request.urlopen("http://127.0.0.1:%s/status" % port, timeout=3).read() if control else sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<120 else 1)'
       interval: 30s
       timeout: 5s
       retries: 3

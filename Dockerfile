@@ -17,4 +17,6 @@ COPY mammotion_go2rtc_bridge.py /app/mammotion_go2rtc_bridge.py
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
+EXPOSE 8099
+
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

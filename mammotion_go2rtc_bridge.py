@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
@@ -12,7 +13,9 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 
 @dataclass
@@ -29,6 +32,10 @@ class Settings:
     keyframe_request_cooldown_seconds: int
     heartbeat_file: str
     dump_stream_json: bool
+    control_enabled: bool
+    control_host: str
+    control_port: int
+    control_auto_stop_seconds: int
 
 
 def parse_args() -> Settings:
@@ -79,6 +86,30 @@ def parse_args() -> Settings:
         help="Touched on every frame; the Docker healthcheck reads it. Set empty to disable.",
     )
     parser.add_argument("--dump-stream-json", action="store_true")
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        default=os.getenv("MAMMOTION_CONTROL_ENABLED", "").lower()
+        in ("1", "true", "yes", "on"),
+        help="Serve a simple browser UI and only stream after clicking Start.",
+    )
+    parser.add_argument(
+        "--control-host",
+        default=os.getenv("MAMMOTION_CONTROL_HOST", "0.0.0.0"),
+        help="Host/IP for the browser control server.",
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=int(os.getenv("MAMMOTION_CONTROL_PORT", "8099")),
+        help="Port for the browser control server.",
+    )
+    parser.add_argument(
+        "--control-auto-stop-seconds",
+        type=int,
+        default=int(os.getenv("MAMMOTION_CONTROL_AUTO_STOP_SECONDS", "0")),
+        help="Optional default runtime after Start before stopping automatically (0 = off).",
+    )
     args = parser.parse_args()
 
     if not args.email or not args.password:
@@ -99,6 +130,10 @@ def parse_args() -> Settings:
         keyframe_request_cooldown_seconds=max(2, args.keyframe_request_cooldown_seconds),
         heartbeat_file=(args.heartbeat_file or "").strip(),
         dump_stream_json=bool(args.dump_stream_json),
+        control_enabled=bool(args.control),
+        control_host=args.control_host,
+        control_port=max(1, min(65535, args.control_port)),
+        control_auto_stop_seconds=max(0, args.control_auto_stop_seconds),
     )
 
 
@@ -628,28 +663,18 @@ async def fetch_stream_fields(mammotion: Any, device_name: str) -> dict[str, Any
     }
 
 
-async def main() -> None:
-    settings = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-    logging.info("Loading Mammotion SDK modules")
-    from pymammotion.client import MammotionClient
-
-    stop_async = asyncio.Event()
-
+async def run_stream_loop(
+    settings: Settings,
+    stop_async: asyncio.Event,
+    MammotionClient: Any,
+) -> None:
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_async.set)
-        except NotImplementedError:
-            signal.signal(sig, lambda *_: stop_async.set())
 
     async def _fresh_client() -> "Any | None":
-        # A *new* client + full username/password login every cycle. The
+        # A new client + full username/password login every cycle. The
         # pymammotion refresh token goes stale after a few hours
         # ("refreshToken invalid!!"); reusing the same client then leaves us
-        # with a dead cloud session that can't send wake-up commands. Starting
-        # fresh sidesteps the dead refresh token entirely.
+        # with a dead cloud session that can't send wake-up commands.
         while not stop_async.is_set():
             client = MammotionClient(ha_version="3.4.23")
             try:
@@ -676,7 +701,7 @@ async def main() -> None:
         try:
             mammotion = await _fresh_client()
             if mammotion is None:
-                break  # stop requested during login
+                break
 
             fields = await fetch_stream_fields(mammotion, settings.mammotion_device_name)
             if settings.dump_stream_json:
@@ -716,11 +741,6 @@ async def main() -> None:
                 if settings.refresh_seconds > 0
                 else None
             )
-            # Proactive keep-alive. The Mammotion app sends
-            # send_todev_ble_sync(sync_type=2) every ~20s to tell the device a
-            # viewer is present; without it the device leaves the Agora channel
-            # after ~50s. Sending it ourselves should keep the publisher online
-            # continuously instead of relying on reactive recovery after it drops.
             keepalive_interval = 20.0
             next_keepalive = time.time() + keepalive_interval
             while not stop_async.is_set() and not bridge.stop_event.is_set():
@@ -755,9 +775,6 @@ async def main() -> None:
                     raise RuntimeError("No first frame received after startup timeout")
 
                 if bridge.last_frame_ts > 0 and bridge.peer_online:
-                    # While peer_online is False the bridge is mid-recovery
-                    # (publisher dropped, wake-up scheduled) — silence the
-                    # stall watchdog instead of restarting the whole cycle.
                     stall_age = now - bridge.last_frame_ts
                     if (
                         stall_age > settings.soft_stall_timeout_seconds
@@ -768,10 +785,6 @@ async def main() -> None:
                     if stall_age > settings.frame_stall_timeout_seconds:
                         raise RuntimeError("Frame stream stalled")
 
-                # Publisher-gone-too-long watchdog. Fires even while
-                # peer_online is False, so a dead cloud session (recovery
-                # wake-ups failing) forces a full cycle restart — which
-                # re-logins with a fresh MammotionClient next iteration.
                 if (
                     not bridge.peer_online
                     and bridge.peer_offline_since > 0
@@ -798,14 +811,258 @@ async def main() -> None:
                     bridge.frames_dropped,
                 )
                 bridge.stop()
-            # Tear down the per-cycle cloud client so the next cycle logs in
-            # fresh (new tokens) rather than inheriting a dead session.
             if mammotion is not None:
                 try:
                     await mammotion.stop()
                 except Exception:
                     logging.exception("Mammotion stop failed")
-                mammotion = None
+
+
+class StreamController:
+    def __init__(self, settings: Settings, MammotionClient: Any) -> None:
+        self.settings = settings
+        self.MammotionClient = MammotionClient
+        self._lock = asyncio.Lock()
+        self._task: asyncio.Task[None] | None = None
+        self._stop_event: asyncio.Event | None = None
+        self._started_at = 0.0
+        self._last_error = ""
+
+    async def start(self, ttl_seconds: int = 0) -> dict[str, Any]:
+        async with self._lock:
+            if self._task is not None and not self._task.done():
+                return self.status_unlocked()
+            self._stop_event = asyncio.Event()
+            self._started_at = time.time()
+            self._last_error = ""
+            ttl = max(0, ttl_seconds or self.settings.control_auto_stop_seconds)
+            self._task = asyncio.create_task(self._run(self._stop_event, ttl))
+            logging.info("Manual stream start requested%s", f" (ttl={ttl}s)" if ttl else "")
+            return self.status_unlocked()
+
+    async def stop(self) -> dict[str, Any]:
+        task: asyncio.Task[None] | None
+        async with self._lock:
+            if self._stop_event is not None:
+                self._stop_event.set()
+            task = self._task
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=30)
+            except asyncio.TimeoutError:
+                logging.warning("Timed out waiting for manual stream stop")
+        async with self._lock:
+            return self.status_unlocked()
+
+    async def status(self) -> dict[str, Any]:
+        async with self._lock:
+            return self.status_unlocked()
+
+    def status_unlocked(self) -> dict[str, Any]:
+        running = self._task is not None and not self._task.done()
+        uptime = int(time.time() - self._started_at) if running and self._started_at else 0
+        return {
+            "running": running,
+            "uptime_seconds": uptime,
+            "rtsp_url": self.settings.rtsp_publish_url,
+            "last_error": self._last_error,
+        }
+
+    async def _run(self, stop_event: asyncio.Event, ttl_seconds: int) -> None:
+        timer_task: asyncio.Task[None] | None = None
+        if ttl_seconds > 0:
+            timer_task = asyncio.create_task(self._stop_after(stop_event, ttl_seconds))
+        try:
+            await run_stream_loop(self.settings, stop_event, self.MammotionClient)
+        except Exception as exc:
+            self._last_error = str(exc)
+            logging.exception("Manual stream task failed")
+        finally:
+            if timer_task is not None:
+                timer_task.cancel()
+            async with self._lock:
+                if self._task is asyncio.current_task():
+                    self._task = None
+                    self._stop_event = None
+                    self._started_at = 0.0
+
+    async def _stop_after(self, stop_event: asyncio.Event, ttl_seconds: int) -> None:
+        await asyncio.sleep(ttl_seconds)
+        logging.info("Manual stream TTL expired after %ss; stopping", ttl_seconds)
+        stop_event.set()
+
+
+def render_control_page(status: dict[str, Any], settings: Settings) -> str:
+    state = "running" if status["running"] else "stopped"
+    escaped_rtsp = html.escape(str(status["rtsp_url"]))
+    escaped_error = html.escape(str(status["last_error"] or ""))
+    return f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>Mammotion Stream Control</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f4f6f8; color: #17202a; }}
+    main {{ width: min(480px, calc(100vw - 32px)); padding: 24px; border: 1px solid #d6dde5; border-radius: 8px; background: #ffffff; box-shadow: 0 12px 36px rgba(31, 45, 61, .12); }}
+    h1 {{ margin: 0 0 18px; font-size: 22px; font-weight: 650; }}
+    .status {{ display: flex; justify-content: space-between; gap: 16px; padding: 12px 0; border-block: 1px solid #e6ebf0; }}
+    .badge {{ font-weight: 700; color: {'#147d3f' if status['running'] else '#8a3b12'}; }}
+    .row {{ margin-top: 16px; display: flex; gap: 10px; flex-wrap: wrap; }}
+    button {{ min-width: 112px; border: 0; border-radius: 6px; padding: 11px 14px; font: inherit; font-weight: 650; cursor: pointer; }}
+    .start {{ background: #116149; color: white; }}
+    .stop {{ background: #a63a2a; color: white; }}
+    .muted {{ background: #e9eef3; color: #17202a; }}
+    dl {{ margin: 16px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; font-size: 14px; }}
+    dt {{ color: #5a6876; }}
+    dd {{ margin: 0; overflow-wrap: anywhere; }}
+    @media (prefers-color-scheme: dark) {{
+      body {{ background: #111820; color: #eef3f7; }} main {{ background: #18222d; border-color: #2d3b49; }}
+      .status {{ border-color: #2d3b49; }} .muted {{ background: #2a3642; color: #eef3f7; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Mammotion Stream</h1>
+    <div class=\"status\"><span>Status</span><span class=\"badge\" id=\"state\">{state}</span></div>
+    <div class=\"row\">
+      <button class=\"start\" onclick=\"control('start')\">Start</button>
+      <button class=\"stop\" onclick=\"control('stop')\">Stop</button>
+      <button class=\"muted\" onclick=\"refreshStatus()\">Refresh</button>
+    </div>
+    <dl>
+      <dt>Uptime</dt><dd id=\"uptime\">{status['uptime_seconds']}s</dd>
+      <dt>RTSP</dt><dd>{escaped_rtsp}</dd>
+      <dt>Auto stop</dt><dd>{settings.control_auto_stop_seconds or 'off'}</dd>
+      <dt>Error</dt><dd id=\"error\">{escaped_error}</dd>
+    </dl>
+  </main>
+  <script>
+    async function control(action) {{
+      await fetch('/' + action, {{ method: 'POST' }});
+      await refreshStatus();
+    }}
+    async function refreshStatus() {{
+      const res = await fetch('/status');
+      const s = await res.json();
+      document.getElementById('state').textContent = s.running ? 'running' : 'stopped';
+      document.getElementById('uptime').textContent = s.uptime_seconds + 's';
+      document.getElementById('error').textContent = s.last_error || '';
+    }}
+    setInterval(refreshStatus, 3000);
+  </script>
+</body>
+</html>"""
+
+
+def make_control_handler(
+    controller: StreamController,
+    settings: Settings,
+    loop: asyncio.AbstractEventLoop,
+) -> type[BaseHTTPRequestHandler]:
+    class ControlHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            logging.info("control %s - " + fmt, self.address_string(), *args)
+
+        def do_GET(self) -> None:
+            self._handle()
+
+        def do_POST(self) -> None:
+            self._handle()
+
+        def _handle(self) -> None:
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/status":
+                    self._send_json(self._call(controller.status()))
+                elif parsed.path == "/start":
+                    query = parse_qs(parsed.query)
+                    ttl = int(query.get("ttl", ["0"])[0] or "0")
+                    self._send_json(self._call(controller.start(ttl_seconds=ttl)))
+                elif parsed.path == "/stop":
+                    self._send_json(self._call(controller.stop()))
+                elif parsed.path in ("/", "/index.html"):
+                    status = self._call(controller.status())
+                    self._send_html(render_control_page(status, settings))
+                else:
+                    self.send_error(404)
+            except Exception as exc:
+                logging.exception("Control request failed")
+                self._send_json({"error": str(exc)}, status=500)
+
+        def _call(self, coro: Any) -> Any:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            return fut.result(timeout=35)
+
+        def _send_json(self, data: Any, status: int = 200) -> None:
+            payload = json.dumps(data).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _send_html(self, body: str) -> None:
+            payload = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return ControlHandler
+
+
+def start_control_server(
+    controller: StreamController,
+    settings: Settings,
+    loop: asyncio.AbstractEventLoop,
+) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(
+        (settings.control_host, settings.control_port),
+        make_control_handler(controller, settings, loop),
+    )
+    thread = threading.Thread(target=server.serve_forever, name="control-http", daemon=True)
+    thread.start()
+    logging.info(
+        "Manual control UI listening on http://%s:%s",
+        settings.control_host,
+        settings.control_port,
+    )
+    return server
+
+
+async def main() -> None:
+    settings = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    logging.info("Loading Mammotion SDK modules")
+    from pymammotion.client import MammotionClient
+
+    stop_async = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_async.set)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: stop_async.set())
+
+    if not settings.control_enabled:
+        await run_stream_loop(settings, stop_async, MammotionClient)
+        return
+
+    controller = StreamController(settings, MammotionClient)
+    server = start_control_server(controller, settings, loop)
+    try:
+        await stop_async.wait()
+    finally:
+        logging.info("Stopping manual control server")
+        server.shutdown()
+        await controller.stop()
 
 
 if __name__ == "__main__":

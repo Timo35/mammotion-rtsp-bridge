@@ -89,6 +89,13 @@ services:
       # Defaults to rtsp://frigate:8554/mammotion — only set if different.
       #GO2RTC_PUBLISH_URL: "rtsp://frigate:8554/mammotion"
 
+      # Optional: browser-controlled mode. The container stays running, but the
+      # Mammotion stream is only started after clicking Start in the control UI.
+      MAMMOTION_CONTROL_ENABLED: "true"
+      MAMMOTION_CONTROL_PORT: "8099"
+    ports:
+      - "8099:8099"
+
 volumes:
   frigate-config:
 ```
@@ -104,13 +111,33 @@ three are required; the rest have sensible defaults.
 | `MAMMOTION_PASSWORD` | — | Mammotion account password |
 | `MAMMOTION_DEVICE_NAME` | `first` | Device name in the app, or `first` to auto-pick |
 | `GO2RTC_PUBLISH_URL` | `rtsp://frigate:8554/mammotion` | Where the bridge publishes; stream name must match go2rtc |
-| `MAMMOTION_HEARTBEAT_FILE` | unset | File touched per frame for the Docker healthcheck |
+| `MAMMOTION_HEARTBEAT_FILE` | `/tmp/mammotion_heartbeat` | File touched per frame for the Docker healthcheck |
+| `MAMMOTION_CONTROL_ENABLED` | `false` | Enable browser control mode; stream starts only via `/start` or the UI |
+| `MAMMOTION_CONTROL_HOST` | `0.0.0.0` | Bind address for the control web server |
+| `MAMMOTION_CONTROL_PORT` | `8099` | Port for the control web server |
+| `MAMMOTION_CONTROL_AUTO_STOP_SECONDS` | `0` | Stop stream automatically after this many seconds (0 = off) |
 | `MAMMOTION_REFRESH_SECONDS` | `1800` | Agora token refresh interval (0 = off) |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Delay before retrying after a failure |
 | `MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS` | `90` | Restart if no first frame after connect |
 | `MAMMOTION_SOFT_STALL_TIMEOUT_SECONDS` | `12` | Request a keyframe after this much stall |
 | `MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS` | `8` | Min seconds between keyframe requests |
 | `MAMMOTION_FRAME_STALL_TIMEOUT_SECONDS` | `120` | Hard-restart cycle if frames/publisher stay gone this long |
+
+### Browser-controlled streaming
+
+Set `MAMMOTION_CONTROL_ENABLED=true` to keep the container alive without
+immediately opening the Mammotion camera session. Open
+`http://<docker-host>:8099` and use Start/Stop, or call the endpoints directly:
+
+```bash
+curl -X POST http://<docker-host>:8099/start
+curl -X POST http://<docker-host>:8099/stop
+curl http://<docker-host>:8099/status
+```
+
+You can also start with a one-off timeout, for example `/start?ttl=300` to stop
+after five minutes. In this mode go2rtc still has the `mammotion` stream name,
+but it only receives video while the bridge is running.
 
 ### go2rtc / Frigate
 
