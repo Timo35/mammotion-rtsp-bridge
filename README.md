@@ -116,9 +116,11 @@ three are required; the rest have sensible defaults.
 | `MAMMOTION_CONTROL_HOST` | `0.0.0.0` | Bind address for the control web server |
 | `MAMMOTION_CONTROL_PORT` | `8099` | Port for the control web server |
 | `MAMMOTION_CONTROL_AUTO_STOP_SECONDS` | `0` | Stop stream automatically after this many seconds (0 = off) |
-| `MAMMOTION_KEEPALIVE_SECONDS` | `0` | Optional viewer keep-alive interval while streaming (0 = off; compose example uses `5`) |
+| `MAMMOTION_KEEPALIVE_SECONDS` | `0` | Optional viewer keep-alive interval while streaming (0 = off) |
+| `MAMMOTION_OFFLINE_STOP_SECONDS` | `0` | Stop stream after publisher is offline this long (0 = keep retrying; compose example uses `180`) |
 | `MAMMOTION_REFRESH_SECONDS` | `1800` | Agora token refresh interval (0 = off) |
-| `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Delay before retrying after a failure |
+| `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Initial delay before retrying after a failure |
+| `MAMMOTION_RECONNECT_BACKOFF_MAX_SECONDS` | `300` | Maximum retry delay after repeated failures |
 | `MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS` | `90` | Restart if no first frame after connect |
 | `MAMMOTION_SOFT_STALL_TIMEOUT_SECONDS` | `12` | Request a keyframe after this much stall |
 | `MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS` | `8` | Min seconds between keyframe requests |
@@ -141,15 +143,15 @@ curl http://<docker-host>:8099/status
 
 You can also start with a one-off timeout, for example `/start?ttl=300` to stop
 after five minutes. In this mode go2rtc still has the `mammotion` stream name,
-but it only receives video while the bridge is running. By default the bridge code does not send periodic MQTT keep-alives, because
-some Mammotion sessions reject those IoT tokens and churn the cloud connection.
-The compose example sets `MAMMOTION_KEEPALIVE_SECONDS=5` because some mowers
-otherwise leave the Agora publisher every ~15 seconds. Keep-alives are only sent
-while the publisher is online. Set it back to `0` if Aliyun token churn appears
-again. When the Agora publisher drops, the bridge schedules recovery after any
-active cooldown instead of losing the recovery event. If Mammotion/Aliyun rejects
-a cloud session during a manual run, the stream process logs in again and keeps
-trying until you press Stop or the TTL expires.
+but it only receives video while the bridge is running. The compose example uses account-safe defaults: periodic MQTT keep-alives are
+off, reconnects back off exponentially up to five minutes, and the manual stream
+stops if the publisher stays offline for three minutes. Set
+`MAMMOTION_KEEPALIVE_SECONDS` above `0` only if you need to reduce short Agora
+publisher drops; keep-alives are sent only while the publisher is online. When
+the Agora publisher drops, the bridge schedules recovery after any active
+cooldown instead of losing the recovery event. If Mammotion/Aliyun rejects a
+cloud session during a manual run, the stream process backs off instead of
+retrying rapidly.
 
 ### go2rtc / Frigate
 

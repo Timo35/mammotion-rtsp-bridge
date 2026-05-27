@@ -27,6 +27,8 @@ class Settings:
     rtsp_publish_url: str
     refresh_seconds: int
     reconnect_backoff_seconds: int
+    reconnect_backoff_max_seconds: int
+    offline_stop_seconds: int
     startup_frame_timeout_seconds: int
     soft_stall_timeout_seconds: int
     frame_stall_timeout_seconds: int
@@ -61,6 +63,18 @@ def parse_args() -> Settings:
         "--reconnect-backoff-seconds",
         type=int,
         default=int(os.getenv("MAMMOTION_RECONNECT_BACKOFF_SECONDS", "8")),
+    )
+    parser.add_argument(
+        "--reconnect-backoff-max-seconds",
+        type=int,
+        default=int(os.getenv("MAMMOTION_RECONNECT_BACKOFF_MAX_SECONDS", "300")),
+        help="Maximum reconnect/login backoff after repeated Mammotion cloud failures.",
+    )
+    parser.add_argument(
+        "--offline-stop-seconds",
+        type=int,
+        default=int(os.getenv("MAMMOTION_OFFLINE_STOP_SECONDS", "0")),
+        help="Stop the stream after the publisher is offline this long (0 = keep retrying).",
     )
     parser.add_argument(
         "--startup-frame-timeout-seconds",
@@ -132,6 +146,8 @@ def parse_args() -> Settings:
         rtsp_publish_url=args.rtsp_url,
         refresh_seconds=max(0, args.refresh_seconds),
         reconnect_backoff_seconds=max(1, args.reconnect_backoff_seconds),
+        reconnect_backoff_max_seconds=max(1, args.reconnect_backoff_max_seconds),
+        offline_stop_seconds=max(0, args.offline_stop_seconds),
         startup_frame_timeout_seconds=max(10, args.startup_frame_timeout_seconds),
         soft_stall_timeout_seconds=max(3, args.soft_stall_timeout_seconds),
         frame_stall_timeout_seconds=max(10, args.frame_stall_timeout_seconds),
@@ -293,12 +309,10 @@ class _EncodedFrameObserver:
 
 
 class AgoraToRtsp:
-    # Mirror the Mammotion HA integration's peer-recovery timing (see
-    # custom_components/mammotion/agora_websocket.py: PEER_REJOIN_DEBOUNCE_SECS
-    # and PEER_RECOVER_COOLDOWN_SECS). 2s debounce lets a naturally fast rejoin
-    # happen without a wake-up poke; 15s cooldown prevents thrash if the device
-    # is genuinely unreachable.
-    PEER_REJOIN_DEBOUNCE_SECS = 2.0
+    # Keep recovery quick: this publisher is often gone for only a few seconds,
+    # so a long debounce becomes visible as a frozen frame in go2rtc. The
+    # cooldown still prevents repeated wake-up spam if the device is unreachable.
+    PEER_REJOIN_DEBOUNCE_SECS = 0.5
     PEER_RECOVER_COOLDOWN_SECS = 15.0
 
     def __init__(self, rtsp_url: str, area_code: int, heartbeat_file: str = "") -> None:
@@ -687,10 +701,10 @@ async def run_stream_loop(
     loop = asyncio.get_running_loop()
 
     async def _fresh_client() -> "Any | None":
-        # A new client + full username/password login every cycle. The
-        # pymammotion refresh token goes stale after a few hours
-        # ("refreshToken invalid!!"); reusing the same client then leaves us
-        # with a dead cloud session that can't send wake-up commands.
+        # A new client + full username/password login every cycle. Back off
+        # exponentially so cloud outages do not hammer Mammotion login endpoints.
+        delay = settings.reconnect_backoff_seconds
+        max_delay = max(settings.reconnect_backoff_seconds, settings.reconnect_backoff_max_seconds)
         while not stop_async.is_set():
             client = MammotionClient(ha_version="3.4.23")
             try:
@@ -700,17 +714,19 @@ async def run_stream_loop(
                 )
                 return client
             except Exception:
-                logging.exception(
-                    "Mammotion login failed; retrying in %ss",
-                    settings.reconnect_backoff_seconds,
-                )
+                logging.exception("Mammotion login failed; retrying in %ss", delay)
                 try:
                     await client.stop()
                 except Exception:
                     pass
-                await asyncio.sleep(settings.reconnect_backoff_seconds)
+                await asyncio.sleep(delay)
+                delay = min(max_delay, max(delay + 1, delay * 2))
         return None
 
+    reconnect_delay = settings.reconnect_backoff_seconds
+    max_reconnect_delay = max(
+        settings.reconnect_backoff_seconds, settings.reconnect_backoff_max_seconds
+    )
     while not stop_async.is_set():
         bridge: AgoraToRtsp | None = None
         mammotion: Any = None
@@ -751,6 +767,7 @@ async def run_stream_loop(
                 raise RuntimeError("Timed out waiting for Agora connection")
 
             logging.info("Bridge active. Publishing to %s", settings.rtsp_publish_url)
+            reconnect_delay = settings.reconnect_backoff_seconds
 
             next_refresh = (
                 time.time() + settings.refresh_seconds
@@ -759,20 +776,29 @@ async def run_stream_loop(
             )
             keepalive_interval = float(settings.keepalive_seconds)
             next_keepalive = time.time() + keepalive_interval
+            was_peer_online = bridge.peer_online
             while not stop_async.is_set() and not bridge.stop_event.is_set():
                 await asyncio.sleep(1.0)
                 now = time.time()
 
-                if keepalive_interval > 0 and bridge.peer_online and now >= next_keepalive:
+                just_joined = bridge.peer_online and not was_peer_online
+                if keepalive_interval > 0 and bridge.peer_online and (
+                    just_joined or now >= next_keepalive
+                ):
                     try:
                         await mammotion.send_command_with_args(
                             fields["device_name"], "send_todev_ble_sync", sync_type=2
+                        )
+                        logging.info(
+                            "Sent viewer keep-alive%s",
+                            " after publisher join" if just_joined else "",
                         )
                     except Exception:
                         logging.debug("Keep-alive sync failed", exc_info=True)
                     next_keepalive = now + keepalive_interval
                 elif not bridge.peer_online:
                     next_keepalive = now + keepalive_interval
+                was_peer_online = bridge.peer_online
 
                 if next_refresh is not None and now >= next_refresh:
                     refreshed = await mammotion.refresh_stream_subscription(
@@ -803,24 +829,31 @@ async def run_stream_loop(
                     if stall_age > settings.frame_stall_timeout_seconds:
                         raise RuntimeError("Frame stream stalled")
 
-                if (
-                    not bridge.peer_online
-                    and bridge.peer_offline_since > 0
-                    and now - bridge.peer_offline_since
-                    > settings.frame_stall_timeout_seconds
-                ):
-                    raise RuntimeError(
-                        "Publisher gone too long (likely dead cloud session); "
-                        "restarting cycle"
-                    )
+                if not bridge.peer_online and bridge.peer_offline_since > 0:
+                    offline_age = now - bridge.peer_offline_since
+                    if (
+                        settings.offline_stop_seconds > 0
+                        and offline_age > settings.offline_stop_seconds
+                    ):
+                        logging.warning(
+                            "Publisher offline for %.0fs; stopping stream to avoid "
+                            "hammering Mammotion cloud",
+                            offline_age,
+                        )
+                        return
+                    if offline_age > settings.frame_stall_timeout_seconds:
+                        raise RuntimeError(
+                            "Publisher gone too long (likely dead cloud session); "
+                            "restarting cycle"
+                        )
         except Exception:
             if stop_async.is_set():
                 break
-            logging.exception(
-                "Bridge cycle failed; reconnecting in %ss",
-                settings.reconnect_backoff_seconds,
+            logging.exception("Bridge cycle failed; reconnecting in %ss", reconnect_delay)
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(
+                max_reconnect_delay, max(reconnect_delay + 1, reconnect_delay * 2)
             )
-            await asyncio.sleep(settings.reconnect_backoff_seconds)
         finally:
             if bridge is not None:
                 logging.info(
@@ -943,6 +976,10 @@ class StreamController:
             str(self.settings.refresh_seconds),
             "--reconnect-backoff-seconds",
             str(self.settings.reconnect_backoff_seconds),
+            "--reconnect-backoff-max-seconds",
+            str(self.settings.reconnect_backoff_max_seconds),
+            "--offline-stop-seconds",
+            str(self.settings.offline_stop_seconds),
             "--startup-frame-timeout-seconds",
             str(self.settings.startup_frame_timeout_seconds),
             "--soft-stall-timeout-seconds",

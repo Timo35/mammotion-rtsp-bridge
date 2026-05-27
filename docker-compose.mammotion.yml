@@ -21,14 +21,18 @@ services:
       MAMMOTION_CONTROL_PORT: "8099"
       # Optional: stop automatically after N seconds (0 = off).
       MAMMOTION_CONTROL_AUTO_STOP_SECONDS: "0"
-      # Optional MQTT keep-alive while streaming. Use 0 to rely on Agora recovery only.
-      MAMMOTION_KEEPALIVE_SECONDS: "5"
+      # Account-safe defaults: avoid MQTT keep-alive unless you need fewer pauses.
+      MAMMOTION_KEEPALIVE_SECONDS: "0"
+      # Back off cloud/login retries to avoid stressing Mammotion.
+      MAMMOTION_RECONNECT_BACKOFF_SECONDS: "30"
+      MAMMOTION_RECONNECT_BACKOFF_MAX_SECONDS: "300"
+      # Stop manual stream if the publisher stays offline for 3 minutes.
+      MAMMOTION_OFFLINE_STOP_SECONDS: "180"
       # File touched per frame when the stream is actually running.
       MAMMOTION_HEARTBEAT_FILE: "/tmp/mammotion_heartbeat"
 
       # ── Optional tuning (defaults shown; uncomment to change) ─────────────
       #MAMMOTION_REFRESH_SECONDS: "1800"                    # Agora token refresh (0=off)
-      #MAMMOTION_RECONNECT_BACKOFF_SECONDS: "8"             # retry delay after failure
       #MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS: "90"        # restart if no first frame
       #MAMMOTION_SOFT_STALL_TIMEOUT_SECONDS: "12"           # request keyframe after stall
       #MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS: "8"     # min gap between keyframe reqs
