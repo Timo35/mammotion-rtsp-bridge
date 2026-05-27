@@ -30,6 +30,7 @@ class Settings:
     soft_stall_timeout_seconds: int
     frame_stall_timeout_seconds: int
     keyframe_request_cooldown_seconds: int
+    keepalive_seconds: int
     heartbeat_file: str
     dump_stream_json: bool
     control_enabled: bool
@@ -81,6 +82,12 @@ def parse_args() -> Settings:
         default=int(os.getenv("MAMMOTION_KEYFRAME_REQUEST_COOLDOWN_SECONDS", "8")),
     )
     parser.add_argument(
+        "--keepalive-seconds",
+        type=int,
+        default=int(os.getenv("MAMMOTION_KEEPALIVE_SECONDS", "10")),
+        help="Seconds between Mammotion viewer keep-alives while streaming.",
+    )
+    parser.add_argument(
         "--heartbeat-file",
         default=os.getenv("MAMMOTION_HEARTBEAT_FILE", "/tmp/mammotion_heartbeat"),
         help="Touched on every frame; the Docker healthcheck reads it. Set empty to disable.",
@@ -128,6 +135,7 @@ def parse_args() -> Settings:
         soft_stall_timeout_seconds=max(3, args.soft_stall_timeout_seconds),
         frame_stall_timeout_seconds=max(10, args.frame_stall_timeout_seconds),
         keyframe_request_cooldown_seconds=max(2, args.keyframe_request_cooldown_seconds),
+        keepalive_seconds=max(5, args.keepalive_seconds),
         heartbeat_file=(args.heartbeat_file or "").strip(),
         dump_stream_json=bool(args.dump_stream_json),
         control_enabled=bool(args.control),
@@ -741,7 +749,13 @@ async def run_stream_loop(
                 if settings.refresh_seconds > 0
                 else None
             )
-            keepalive_interval = 20.0
+            keepalive_interval = float(settings.keepalive_seconds)
+            try:
+                await mammotion.send_command_with_args(
+                    fields["device_name"], "send_todev_ble_sync", sync_type=2
+                )
+            except Exception:
+                logging.debug("Initial keep-alive sync failed", exc_info=True)
             next_keepalive = time.time() + keepalive_interval
             while not stop_async.is_set() and not bridge.stop_event.is_set():
                 await asyncio.sleep(1.0)

@@ -116,6 +116,7 @@ three are required; the rest have sensible defaults.
 | `MAMMOTION_CONTROL_HOST` | `0.0.0.0` | Bind address for the control web server |
 | `MAMMOTION_CONTROL_PORT` | `8099` | Port for the control web server |
 | `MAMMOTION_CONTROL_AUTO_STOP_SECONDS` | `0` | Stop stream automatically after this many seconds (0 = off) |
+| `MAMMOTION_KEEPALIVE_SECONDS` | `10` | Viewer keep-alive interval while streaming |
 | `MAMMOTION_REFRESH_SECONDS` | `1800` | Agora token refresh interval (0 = off) |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Delay before retrying after a failure |
 | `MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS` | `90` | Restart if no first frame after connect |
@@ -137,7 +138,12 @@ curl http://<docker-host>:8099/status
 
 You can also start with a one-off timeout, for example `/start?ttl=300` to stop
 after five minutes. In this mode go2rtc still has the `mammotion` stream name,
-but it only receives video while the bridge is running.
+but it only receives video while the bridge is running. The bridge sends a
+viewer keep-alive immediately after starting and then every
+`MAMMOTION_KEEPALIVE_SECONDS` seconds so Mammotion does not drop the publisher
+before the first scheduled keep-alive. If Mammotion/Aliyun rejects a cloud
+session during a manual run, the bridge logs in again and keeps trying until
+you press Stop or the TTL expires.
 
 ### go2rtc / Frigate
 
