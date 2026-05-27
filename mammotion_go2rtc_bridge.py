@@ -759,24 +759,19 @@ async def run_stream_loop(
             )
             keepalive_interval = float(settings.keepalive_seconds)
             next_keepalive = time.time() + keepalive_interval
-            if keepalive_interval > 0:
-                try:
-                    await mammotion.send_command_with_args(
-                        fields["device_name"], "send_todev_ble_sync", sync_type=2
-                    )
-                except Exception:
-                    logging.debug("Initial keep-alive sync failed", exc_info=True)
             while not stop_async.is_set() and not bridge.stop_event.is_set():
                 await asyncio.sleep(1.0)
                 now = time.time()
 
-                if keepalive_interval > 0 and now >= next_keepalive:
+                if keepalive_interval > 0 and bridge.peer_online and now >= next_keepalive:
                     try:
                         await mammotion.send_command_with_args(
                             fields["device_name"], "send_todev_ble_sync", sync_type=2
                         )
                     except Exception:
                         logging.debug("Keep-alive sync failed", exc_info=True)
+                    next_keepalive = now + keepalive_interval
+                elif not bridge.peer_online:
                     next_keepalive = now + keepalive_interval
 
                 if next_refresh is not None and now >= next_refresh:
