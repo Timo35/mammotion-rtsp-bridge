@@ -12,6 +12,7 @@ RUN apt-get update \
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN python -c "from agora.rtc.agora_service import AgoraService"
 
 COPY mammotion_go2rtc_bridge.py /app/mammotion_go2rtc_bridge.py
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh

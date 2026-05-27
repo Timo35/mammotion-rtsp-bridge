@@ -1076,7 +1076,7 @@ def make_control_handler(
             # Browsers/proxies occasionally try HTTPS against this HTTP-only port.
             # That creates noisy binary "Bad request version" lines but is harmless.
             message = fmt % args if args else fmt
-            if "Bad request" in message:
+            if "Bad request" in message or "Bad HTTP" in message:
                 logging.debug("control %s - %s", self.address_string(), message)
                 return
             logging.warning("control %s - %s", self.address_string(), message)
