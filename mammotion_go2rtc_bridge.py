@@ -10,6 +10,7 @@ import os
 import queue
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -84,8 +85,8 @@ def parse_args() -> Settings:
     parser.add_argument(
         "--keepalive-seconds",
         type=int,
-        default=int(os.getenv("MAMMOTION_KEEPALIVE_SECONDS", "10")),
-        help="Seconds between Mammotion viewer keep-alives while streaming.",
+        default=int(os.getenv("MAMMOTION_KEEPALIVE_SECONDS", "0")),
+        help="Seconds between Mammotion viewer keep-alives while streaming (0 = off).",
     )
     parser.add_argument(
         "--heartbeat-file",
@@ -135,7 +136,7 @@ def parse_args() -> Settings:
         soft_stall_timeout_seconds=max(3, args.soft_stall_timeout_seconds),
         frame_stall_timeout_seconds=max(10, args.frame_stall_timeout_seconds),
         keyframe_request_cooldown_seconds=max(2, args.keyframe_request_cooldown_seconds),
-        keepalive_seconds=max(5, args.keepalive_seconds),
+        keepalive_seconds=max(0, args.keepalive_seconds),
         heartbeat_file=(args.heartbeat_file or "").strip(),
         dump_stream_json=bool(args.dump_stream_json),
         control_enabled=bool(args.control),
@@ -364,6 +365,9 @@ class AgoraToRtsp:
         loop = self._loop
         if loop is None or loop.is_closed() or self._mammotion is None:
             return
+        if self._recovery_future is not None and not self._recovery_future.done():
+            logging.debug("Recovery already scheduled")
+            return
         try:
             fut = asyncio.run_coroutine_threadsafe(self._recover(), loop)
         except RuntimeError:
@@ -373,34 +377,38 @@ class AgoraToRtsp:
     async def _recover(self) -> None:
         await asyncio.sleep(self.PEER_REJOIN_DEBOUNCE_SECS)
 
-        if self.peer_online:
-            # The mower rejoined under its own steam within the debounce window.
-            return
-        if self.stop_event.is_set():
-            return
+        while not self.stop_event.is_set():
+            if self.peer_online:
+                # The mower rejoined under its own steam.
+                return
 
-        now = time.monotonic()
-        if now - self._last_recovery_ts < self.PEER_RECOVER_COOLDOWN_SECS:
-            logging.debug("Recovery suppressed (cooldown)")
-            return
-        self._last_recovery_ts = now
+            now = time.monotonic()
+            cooldown_remaining = (
+                self.PEER_RECOVER_COOLDOWN_SECS - (now - self._last_recovery_ts)
+            )
+            if cooldown_remaining > 0:
+                logging.info(
+                    "Publisher still gone, waiting %.1fs for recovery cooldown",
+                    cooldown_remaining,
+                )
+                await asyncio.sleep(cooldown_remaining)
+                continue
 
-        logging.info(
-            "Publisher still gone after %.0fs -- sending wake-up command",
-            self.PEER_REJOIN_DEBOUNCE_SECS,
-        )
-        try:
-            await self._mammotion.send_command_with_args(
-                self._device_name, "send_todev_ble_sync", sync_type=3
-            )
-        except Exception:
-            logging.exception("Wake-up command failed")
-        try:
-            await self._mammotion.get_stream_subscription(
-                self._device_name, self._iot_id
-            )
-        except Exception:
-            logging.exception("Stream subscription refresh failed")
+            self._last_recovery_ts = time.monotonic()
+            logging.info("Publisher still gone -- sending wake-up command")
+            try:
+                await self._mammotion.send_command_with_args(
+                    self._device_name, "send_todev_ble_sync", sync_type=3
+                )
+            except Exception:
+                logging.exception("Wake-up command failed")
+            try:
+                await self._mammotion.get_stream_subscription(
+                    self._device_name, self._iot_id
+                )
+            except Exception:
+                logging.exception("Stream subscription refresh failed")
+            return
 
     def _touch_heartbeat(self, now: float) -> None:
         if not self.heartbeat_file or now - self._last_heartbeat_write_ts < 2.0:
@@ -750,18 +758,19 @@ async def run_stream_loop(
                 else None
             )
             keepalive_interval = float(settings.keepalive_seconds)
-            try:
-                await mammotion.send_command_with_args(
-                    fields["device_name"], "send_todev_ble_sync", sync_type=2
-                )
-            except Exception:
-                logging.debug("Initial keep-alive sync failed", exc_info=True)
             next_keepalive = time.time() + keepalive_interval
+            if keepalive_interval > 0:
+                try:
+                    await mammotion.send_command_with_args(
+                        fields["device_name"], "send_todev_ble_sync", sync_type=2
+                    )
+                except Exception:
+                    logging.debug("Initial keep-alive sync failed", exc_info=True)
             while not stop_async.is_set() and not bridge.stop_event.is_set():
                 await asyncio.sleep(1.0)
                 now = time.time()
 
-                if now >= next_keepalive:
+                if keepalive_interval > 0 and now >= next_keepalive:
                     try:
                         await mammotion.send_command_with_args(
                             fields["device_name"], "send_todev_ble_sync", sync_type=2
@@ -833,77 +842,128 @@ async def run_stream_loop(
 
 
 class StreamController:
-    def __init__(self, settings: Settings, MammotionClient: Any) -> None:
+    def __init__(self, settings: Settings, MammotionClient: Any = None) -> None:
         self.settings = settings
-        self.MammotionClient = MammotionClient
         self._lock = asyncio.Lock()
-        self._task: asyncio.Task[None] | None = None
-        self._stop_event: asyncio.Event | None = None
+        self._process: subprocess.Popen[bytes] | None = None
         self._started_at = 0.0
         self._last_error = ""
+        self._ttl_task: asyncio.Task[None] | None = None
 
     async def start(self, ttl_seconds: int = 0) -> dict[str, Any]:
         async with self._lock:
-            if self._task is not None and not self._task.done():
+            self._reap_finished_unlocked()
+            if self._process is not None:
                 return self.status_unlocked()
-            self._stop_event = asyncio.Event()
+
+            ttl = max(0, ttl_seconds or self.settings.control_auto_stop_seconds)
+            cmd = self._stream_command()
+            env = os.environ.copy()
+            env["MAMMOTION_CONTROL_ENABLED"] = "false"
+            logging.info("Manual stream process start requested%s", f" (ttl={ttl}s)" if ttl else "")
+            try:
+                self._process = subprocess.Popen(cmd, env=env)
+            except Exception as exc:
+                self._last_error = str(exc)
+                logging.exception("Failed to start manual stream process")
+                return self.status_unlocked()
+
             self._started_at = time.time()
             self._last_error = ""
-            ttl = max(0, ttl_seconds or self.settings.control_auto_stop_seconds)
-            self._task = asyncio.create_task(self._run(self._stop_event, ttl))
-            logging.info("Manual stream start requested%s", f" (ttl={ttl}s)" if ttl else "")
+            if self._ttl_task is not None:
+                self._ttl_task.cancel()
+            self._ttl_task = asyncio.create_task(self._stop_after(ttl)) if ttl > 0 else None
             return self.status_unlocked()
 
     async def stop(self) -> dict[str, Any]:
-        task: asyncio.Task[None] | None
+        process: subprocess.Popen[bytes] | None
         async with self._lock:
-            if self._stop_event is not None:
-                self._stop_event.set()
-            task = self._task
-        if task is not None and not task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=30)
-            except asyncio.TimeoutError:
-                logging.warning("Timed out waiting for manual stream stop")
+            if self._ttl_task is not None:
+                self._ttl_task.cancel()
+                self._ttl_task = None
+            process = self._process
+            if process is None:
+                return self.status_unlocked()
+            logging.info("Manual stream process stop requested (pid=%s)", process.pid)
+            process.terminate()
+
+        try:
+            await asyncio.to_thread(process.wait, 10)
+        except subprocess.TimeoutExpired:
+            logging.warning("Manual stream process did not stop after SIGTERM; killing")
+            process.kill()
+            await asyncio.to_thread(process.wait)
+
         async with self._lock:
+            self._reap_finished_unlocked()
             return self.status_unlocked()
 
     async def status(self) -> dict[str, Any]:
         async with self._lock:
+            self._reap_finished_unlocked()
             return self.status_unlocked()
 
     def status_unlocked(self) -> dict[str, Any]:
-        running = self._task is not None and not self._task.done()
+        running = self._process is not None and self._process.poll() is None
         uptime = int(time.time() - self._started_at) if running and self._started_at else 0
         return {
             "running": running,
+            "pid": self._process.pid if running and self._process is not None else None,
             "uptime_seconds": uptime,
             "rtsp_url": self.settings.rtsp_publish_url,
             "last_error": self._last_error,
         }
 
-    async def _run(self, stop_event: asyncio.Event, ttl_seconds: int) -> None:
-        timer_task: asyncio.Task[None] | None = None
-        if ttl_seconds > 0:
-            timer_task = asyncio.create_task(self._stop_after(stop_event, ttl_seconds))
-        try:
-            await run_stream_loop(self.settings, stop_event, self.MammotionClient)
-        except Exception as exc:
-            self._last_error = str(exc)
-            logging.exception("Manual stream task failed")
-        finally:
-            if timer_task is not None:
-                timer_task.cancel()
-            async with self._lock:
-                if self._task is asyncio.current_task():
-                    self._task = None
-                    self._stop_event = None
-                    self._started_at = 0.0
+    def _reap_finished_unlocked(self) -> None:
+        if self._process is None:
+            return
+        returncode = self._process.poll()
+        if returncode is None:
+            return
+        logging.info("Manual stream process exited (returncode=%s)", returncode)
+        if returncode != 0:
+            self._last_error = f"stream process exited with code {returncode}"
+        self._process = None
+        self._started_at = 0.0
 
-    async def _stop_after(self, stop_event: asyncio.Event, ttl_seconds: int) -> None:
+    async def _stop_after(self, ttl_seconds: int) -> None:
         await asyncio.sleep(ttl_seconds)
         logging.info("Manual stream TTL expired after %ss; stopping", ttl_seconds)
-        stop_event.set()
+        await self.stop()
+
+    def _stream_command(self) -> list[str]:
+        cmd = [
+            sys.executable,
+            "-u",
+            os.path.abspath(__file__),
+            "--email",
+            self.settings.mammotion_email,
+            "--password",
+            self.settings.mammotion_password,
+            "--device",
+            self.settings.mammotion_device_name,
+            "--rtsp-url",
+            self.settings.rtsp_publish_url,
+            "--refresh-seconds",
+            str(self.settings.refresh_seconds),
+            "--reconnect-backoff-seconds",
+            str(self.settings.reconnect_backoff_seconds),
+            "--startup-frame-timeout-seconds",
+            str(self.settings.startup_frame_timeout_seconds),
+            "--soft-stall-timeout-seconds",
+            str(self.settings.soft_stall_timeout_seconds),
+            "--frame-stall-timeout-seconds",
+            str(self.settings.frame_stall_timeout_seconds),
+            "--keyframe-request-cooldown-seconds",
+            str(self.settings.keyframe_request_cooldown_seconds),
+            "--keepalive-seconds",
+            str(self.settings.keepalive_seconds),
+            "--heartbeat-file",
+            self.settings.heartbeat_file,
+        ]
+        if self.settings.dump_stream_json:
+            cmd.append("--dump-stream-json")
+        return cmd
 
 
 def render_control_page(status: dict[str, Any], settings: Settings) -> str:
@@ -980,6 +1040,26 @@ def make_control_handler(
         def log_message(self, fmt: str, *args: Any) -> None:
             logging.info("control %s - " + fmt, self.address_string(), *args)
 
+        def log_error(self, fmt: str, *args: Any) -> None:
+            # Browsers/proxies occasionally try HTTPS against this HTTP-only port.
+            # That creates noisy binary "Bad request version" lines but is harmless.
+            message = fmt % args if args else fmt
+            if "Bad request" in message:
+                logging.debug("control %s - %s", self.address_string(), message)
+                return
+            logging.warning("control %s - %s", self.address_string(), message)
+
+        def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+            method = self.requestline.split(" ", 1)[0]
+            if str(code).startswith("4") and method not in ("GET", "POST", "HEAD"):
+                logging.debug(
+                    "control %s - suppressed non-HTTP request (code=%s)",
+                    self.address_string(),
+                    code,
+                )
+                return
+            super().log_request(code, size)
+
         def do_GET(self) -> None:
             self._handle()
 
@@ -1054,9 +1134,6 @@ async def main() -> None:
     settings = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    logging.info("Loading Mammotion SDK modules")
-    from pymammotion.client import MammotionClient
-
     stop_async = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1066,10 +1143,13 @@ async def main() -> None:
             signal.signal(sig, lambda *_: stop_async.set())
 
     if not settings.control_enabled:
+        logging.info("Loading Mammotion SDK modules")
+        from pymammotion.client import MammotionClient
+
         await run_stream_loop(settings, stop_async, MammotionClient)
         return
 
-    controller = StreamController(settings, MammotionClient)
+    controller = StreamController(settings)
     server = start_control_server(controller, settings, loop)
     try:
         await stop_async.wait()

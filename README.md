@@ -116,7 +116,7 @@ three are required; the rest have sensible defaults.
 | `MAMMOTION_CONTROL_HOST` | `0.0.0.0` | Bind address for the control web server |
 | `MAMMOTION_CONTROL_PORT` | `8099` | Port for the control web server |
 | `MAMMOTION_CONTROL_AUTO_STOP_SECONDS` | `0` | Stop stream automatically after this many seconds (0 = off) |
-| `MAMMOTION_KEEPALIVE_SECONDS` | `10` | Viewer keep-alive interval while streaming |
+| `MAMMOTION_KEEPALIVE_SECONDS` | `0` | Optional viewer keep-alive interval while streaming (0 = off) |
 | `MAMMOTION_REFRESH_SECONDS` | `1800` | Agora token refresh interval (0 = off) |
 | `MAMMOTION_RECONNECT_BACKOFF_SECONDS` | `8` | Delay before retrying after a failure |
 | `MAMMOTION_STARTUP_FRAME_TIMEOUT_SECONDS` | `90` | Restart if no first frame after connect |
@@ -127,8 +127,11 @@ three are required; the rest have sensible defaults.
 ### Browser-controlled streaming
 
 Set `MAMMOTION_CONTROL_ENABLED=true` to keep the container alive without
-immediately opening the Mammotion camera session. Open
-`http://<docker-host>:8099` and use Start/Stop, or call the endpoints directly:
+immediately opening the Mammotion camera session. In this mode the control
+server starts the actual stream in a separate child process; Stop terminates
+that process so Mammotion/Aliyun background tasks cannot keep running after the
+stream is stopped. Open `http://<docker-host>:8099` and use Start/Stop, or call
+the endpoints directly:
 
 ```bash
 curl -X POST http://<docker-host>:8099/start
@@ -138,12 +141,13 @@ curl http://<docker-host>:8099/status
 
 You can also start with a one-off timeout, for example `/start?ttl=300` to stop
 after five minutes. In this mode go2rtc still has the `mammotion` stream name,
-but it only receives video while the bridge is running. The bridge sends a
-viewer keep-alive immediately after starting and then every
-`MAMMOTION_KEEPALIVE_SECONDS` seconds so Mammotion does not drop the publisher
-before the first scheduled keep-alive. If Mammotion/Aliyun rejects a cloud
-session during a manual run, the bridge logs in again and keeps trying until
-you press Stop or the TTL expires.
+but it only receives video while the bridge is running. By default the bridge does not send periodic MQTT keep-alives, because some
+Mammotion sessions reject those IoT tokens and churn the cloud connection. If
+you set `MAMMOTION_KEEPALIVE_SECONDS` above `0`, it sends viewer keep-alives at
+that interval. When the Agora publisher drops, the bridge schedules recovery
+after any active cooldown instead of losing the recovery event. If
+Mammotion/Aliyun rejects a cloud session during a manual run, the stream process
+logs in again and keeps trying until you press Stop or the TTL expires.
 
 ### go2rtc / Frigate
 
