@@ -1046,6 +1046,8 @@ def render_control_page(status: dict[str, Any], settings: Settings) -> str:
     <div class=\"status\"><span>Status</span><span class=\"badge\" id=\"state\">{state}</span></div>
     <div class=\"row\">
       <button class=\"start\" onclick=\"control('start')\">Start</button>
+      <button class=\"start\" onclick=\"control('start?ttl=1800')\">Start 30 min</button>
+      <button class=\"start\" onclick=\"control('start?ttl=3600')\">Start 60 min</button>
       <button class=\"stop\" onclick=\"control('stop')\">Stop</button>
       <button class=\"muted\" onclick=\"refreshStatus()\">Refresh</button>
     </div>
