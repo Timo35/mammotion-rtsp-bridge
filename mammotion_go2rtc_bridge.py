@@ -884,6 +884,8 @@ class StreamController:
         self._lock = asyncio.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._started_at = 0.0
+        self._expires_at = 0.0
+        self._ttl_seconds = 0
         self._last_error = ""
         self._ttl_task: asyncio.Task[None] | None = None
 
@@ -906,6 +908,8 @@ class StreamController:
                 return self.status_unlocked()
 
             self._started_at = time.time()
+            self._ttl_seconds = ttl
+            self._expires_at = self._started_at + ttl if ttl > 0 else 0.0
             self._last_error = ""
             if self._ttl_task is not None:
                 self._ttl_task.cancel()
@@ -920,6 +924,8 @@ class StreamController:
                 self._ttl_task = None
             process = self._process
             if process is None:
+                self._expires_at = 0.0
+                self._ttl_seconds = 0
                 return self.status_unlocked()
             logging.info("Manual stream process stop requested (pid=%s)", process.pid)
             process.terminate()
@@ -942,11 +948,19 @@ class StreamController:
 
     def status_unlocked(self) -> dict[str, Any]:
         running = self._process is not None and self._process.poll() is None
-        uptime = int(time.time() - self._started_at) if running and self._started_at else 0
+        now = time.time()
+        uptime = int(now - self._started_at) if running and self._started_at else 0
+        remaining = (
+            max(0, int(self._expires_at - now))
+            if running and self._expires_at > 0
+            else None
+        )
         return {
             "running": running,
             "pid": self._process.pid if running and self._process is not None else None,
             "uptime_seconds": uptime,
+            "ttl_seconds": self._ttl_seconds if running else 0,
+            "remaining_seconds": remaining,
             "rtsp_url": self.settings.rtsp_publish_url,
             "last_error": self._last_error,
         }
@@ -962,6 +976,8 @@ class StreamController:
             self._last_error = f"stream process exited with code {returncode}"
         self._process = None
         self._started_at = 0.0
+        self._expires_at = 0.0
+        self._ttl_seconds = 0
 
     async def _stop_after(self, ttl_seconds: int) -> None:
         await asyncio.sleep(ttl_seconds)
@@ -1011,7 +1027,6 @@ class StreamController:
 
 def render_control_page(status: dict[str, Any], settings: Settings) -> str:
     state = "running" if status["running"] else "stopped"
-    escaped_rtsp = html.escape(str(status["rtsp_url"]))
     escaped_error = html.escape(str(status["last_error"] or ""))
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -1052,13 +1067,37 @@ def render_control_page(status: dict[str, Any], settings: Settings) -> str:
       <button class=\"muted\" onclick=\"refreshStatus()\">Refresh</button>
     </div>
     <dl>
-      <dt>Uptime</dt><dd id=\"uptime\">{status['uptime_seconds']}s</dd>
-      <dt>RTSP</dt><dd>{escaped_rtsp}</dd>
-      <dt>Auto stop</dt><dd>{settings.control_auto_stop_seconds or 'off'}</dd>
+      <dt>Remaining</dt><dd id=\"remaining\"></dd>
+      <dt>RTSP</dt><dd id=\"rtsp\"></dd>
+      <dt>Auto stop</dt><dd id=\"autostop\"></dd>
       <dt>Error</dt><dd id=\"error\">{escaped_error}</dd>
     </dl>
   </main>
   <script>
+    const defaultAutoStopSeconds = {settings.control_auto_stop_seconds};
+
+    function formatDuration(value) {{
+      if (value === null || value === undefined || Number(value) <= 0) return 'off';
+      const total = Math.max(0, Math.floor(Number(value)));
+      const minutes = Math.floor(total / 60);
+      const seconds = total % 60;
+      if (minutes > 0) return `${{minutes}}m ${{String(seconds).padStart(2, '0')}}s`;
+      return `${{seconds}}s`;
+    }}
+
+    function streamName(rtspUrl) {{
+      try {{
+        const parsed = new URL(rtspUrl);
+        return parsed.pathname.startsWith('/') ? (parsed.pathname.slice(1) || 'mammotion') : (parsed.pathname || 'mammotion');
+      }} catch {{
+        return 'mammotion';
+      }}
+    }}
+
+    function externalRtspUrl(status) {{
+      return `rtsp://${{window.location.hostname}}:8554/${{streamName(status.rtsp_url)}}`;
+    }}
+
     async function control(action) {{
       await fetch('/' + action, {{ method: 'POST' }});
       await refreshStatus();
@@ -1067,10 +1106,15 @@ def render_control_page(status: dict[str, Any], settings: Settings) -> str:
       const res = await fetch('/status');
       const s = await res.json();
       document.getElementById('state').textContent = s.running ? 'running' : 'stopped';
-      document.getElementById('uptime').textContent = s.uptime_seconds + 's';
+      document.getElementById('remaining').textContent = s.running
+        ? (s.remaining_seconds === null ? 'unlimited' : formatDuration(s.remaining_seconds))
+        : 'stopped';
+      document.getElementById('rtsp').textContent = externalRtspUrl(s);
+      document.getElementById('autostop').textContent = formatDuration(s.ttl_seconds || defaultAutoStopSeconds);
       document.getElementById('error').textContent = s.last_error || '';
     }}
-    setInterval(refreshStatus, 3000);
+    refreshStatus();
+    setInterval(refreshStatus, 1000);
   </script>
 </body>
 </html>"""
